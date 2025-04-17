@@ -5,23 +5,37 @@ import torch
 from torch.utils.data import TensorDataset, DataLoader
 
 def get_data(start_date='2015-01-01', end_date='2022-12-31', dataset="FTSC"):
-    """Download S&P 500 data and calculate log returns and realized variance"""
-    if dataset =="FTSC":
+    """Download financial data and calculate log returns and realized variance"""
+    if dataset == "FTSC":
+        print("Loading FTSC 5-minute interval data...")
         df = pd.read_csv("UK_Index_2000_2025.csv")
         df['Date-Time'] = pd.to_datetime(df['Date-Time'])
         df = df.dropna(axis=1, how='all')
         
+        # Adjust timestamps to GMT
         df['Date-Time'] = df.apply(
             lambda row: row['Date-Time'] + pd.Timedelta(hours=row['GMT Offset']),
             axis=1
         )
         
+        # Drop unnecessary columns
         df = df.drop(columns=["#RIC", "Domain", "Type", "No. Trades", "GMT Offset"])
-
+        
+        # Sort by date-time
+        df = df.sort_values(by='Date-Time')
+        df = df.set_index('Date-Time')
+        
         # Calculate log returns
         df['log_return'] = np.log(df['Last'] / df['Last'].shift(1))
-        df['realized_var'] = df['log_return'].rolling(window=10).var() * 19656
+        
+        # Calculate realized variance - adjusted for 5-minute data
+        # For 5-minute data, there are roughly 78 intervals per day (6.5 hours × 12 intervals/hour)
+        # So annualization factor is 252 days × 78 intervals = 19656
+        df['realized_var'] = df['log_return'].rolling(window=78).var() * 19656  # One trading day window (78 5-min intervals)
 
+        # Drop NA values
+        df = df.dropna()
+        
         return df
     
     else:
