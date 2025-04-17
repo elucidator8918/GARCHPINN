@@ -47,8 +47,4 @@ def load_model(model, path="models/garch_pinn_model.pt"):
     """Load model weights"""
     model.load_state_dict(torch.load(path))
     print(f"Model loaded from {path}")
-    return model
-
-def annualize_volatility(variance, days=252):
-    """Convert daily variance to annualized volatility in percentage"""
-    return np.sqrt(variance * days) * 100
+    return Model
