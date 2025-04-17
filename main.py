@@ -19,30 +19,28 @@ def main():
     print(f"Using device: {device}")
 
     # Initialize Weights & Biases
-    wandb.init(project="pinn-garch-volatility-forecasting", entity=None)
+    wandb.init(project="pinn-garch-volatility-forecasting-ftsc", entity=None)
 
-    # Get S&P 500 data
-    sp500 = get_data()
-    print(f"Data shape: {sp500.shape}")
+    # Get FTSC data
+    ftsc_data = get_data(dataset="FTSC")
+    print(f"Data shape: {ftsc_data.shape}")
 
     # Log data statistics to W&B
     wandb.log({
-        "data_points": len(sp500),
-        "mean_return": sp500['log_return'].mean(),
-        "mean_volatility": np.sqrt(sp500['realized_var'].mean() * 252) * 100
+        "data_points": len(ftsc_data),
+        "mean_return": ftsc_data['log_return'].mean(),
+        "mean_volatility": np.sqrt(ftsc_data['realized_var'].mean()) * 100  # Already annualized
     })
 
-    # Prepare data
-    sequence_length  np.sqrt(sp500['realized_var'].mean() * 252) * 100
-    })
-
-    # Prepare data
-    sequence_length = 20
-    returns, realized_var = prepare_data(sp500, sequence_length, device)
+    # Prepare data - adjust sequence length for 5-min data
+    # For 5-min data, a sequence length of 78 would represent one trading day
+    # But we might want to use a larger window for better context
+    sequence_length = 78  # One trading day of 5-min intervals
+    returns, realized_var = prepare_data(ftsc_data, sequence_length, device)
     print(f"Prepared data shapes: Returns {returns.shape}, RV {realized_var.shape}")
 
     # Create model - use version 2 which avoids in-place operations
-    model = RealizedGARCHPINNv2(hidden_dim=64)
+    model = RealizedGARCHPINNv2()
     # Move model to device (GPU if available)
     model = model.to(device)
 
@@ -66,8 +64,8 @@ def main():
         log_h, log_x, z, u = model.forward(test_batch_returns, torch.log(test_batch_rv))
         print(f"Forward pass shapes: log_h {log_h.shape}, z {z.shape}, u {u.shape}")
 
-        # Now train the model with fewer epochs for demonstration
-        loss_history, detailed_losses = train_model(model, returns, realized_var, epochs=100, lr=0.001, batch_size=512)
+        # Train the model - adjust epochs and batch size for the larger dataset
+        loss_history, detailed_losses = train_model(model, returns, realized_var, epochs=100, lr=0.001, batch_size=256)
 
         # Print learned parameters
         print("\nLearned Parameters:")
@@ -96,20 +94,21 @@ def main():
             "final_mu": model.mu.item()
         })
 
-        # Forecast volatility
-        forecast_horizon = 10
+        # Forecast volatility - adjust forecast horizon for 5-min data
+        # For 5-min data, forecasting 78 steps ahead equals one trading day
+        forecast_horizon = 78  # One trading day
         forecasted_volatility = forecast_volatility(model, returns, realized_var, forecast_horizon)
 
         # Log forecast to W&B
         wandb.log({
             "forecast": wandb.Table(data=pd.DataFrame({
-                "days_ahead": range(len(forecasted_volatility)),
-                "volatility": np.sqrt(forecasted_volatility * 252) * 100
+                "intervals_ahead": range(len(forecasted_volatility)),
+                "volatility": np.sqrt(forecasted_volatility) * 100  # Already annualized
             }))
         })
 
         # Plot results
-        plot_results(sp500, loss_history, detailed_losses, forecasted_volatility)
+        plot_results(ftsc_data, loss_history, detailed_losses, forecasted_volatility)
 
     except Exception as e:
         print(f"Error during execution: {e}")
