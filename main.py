@@ -65,7 +65,7 @@ def main():
         print(f"Forward pass shapes: log_h {log_h.shape}, z {z.shape}, u {u.shape}")
 
         # Train the model - adjust epochs and batch size for the larger dataset
-        loss_history, detailed_losses = train_model(model, returns, realized_var, epochs=100, lr=0.001, batch_size=256)
+        loss_history, detailed_losses = train_model(model, returns, realized_var, epochs=100, lr=0.001, batch_size=4096)
 
         # Print learned parameters
         print("\nLearned Parameters:")
