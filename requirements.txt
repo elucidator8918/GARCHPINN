@@ -1,8 +1,7 @@
 numpy
 pandas
-yfinance
 torch
 matplotlib
-scikit-learn
-wandb
-plotly
+pypdf  # reading papers/
+pytest
+wandb  # optional, --wandb
