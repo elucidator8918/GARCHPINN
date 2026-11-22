@@ -191,3 +191,13 @@ def test_evaluate_reports_other_mgf(fitted):
         cfg = SimpleNamespace(horizons=(1, 5), har_windows=(1, 5, 22), stage1_iters=50, forecast_mgf=mgf)
         r = evaluate(m, ds, cfg)
         assert r["forecast_mgf"] == mgf and alt in r["k=5"] and "model" in r["k=5"]
+
+
+def test_ablation_variants_valid_config():
+    from garchpinn.ablation import VARIANTS
+    from garchpinn.config import Config
+    for name, (_, over, _) in VARIANTS.items():
+        for k in over:
+            assert hasattr(Config(), k), (name, k)
+        Config(**over)
+    assert {"overnight_drop", "moment_raw", "no_warmup"} <= set(VARIANTS)

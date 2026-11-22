@@ -20,13 +20,30 @@ Last updated: 2026-11-23. See also [plan.md](plan.md) for the fast-filter / para
 - [x] Ablation runner: `ablate.py`, 14 variants, resumable, plots P1–P5
 - [x] Reference doc `docs/realized_garch_reference.tex/.pdf`, and the papers in `papers/`
 
-## In progress (fix workflow running when this was written)
+- [x] 5-min overnight gap: overnight return with a learned variance multiplier kappa
+      (return likelihood only; `overnight = model|drop`)
+- [x] Automatic bar-timestamp convention check (`bar_stamp = auto|start|end`)
+- [x] 5-min speed-up: filter restructured (same maths, matches `forward_reference` to 1e-12)
+- [x] Integration pass: 63 tests pass; 4-config smoke and quick ablation clean
+- [x] Ablation switches for the new features: `overnight_drop`, `moment_raw`, `no_warmup`
 
-- [ ] 5-min overnight gap: overnight return with its own variance multiplier kappa
-- [ ] Automatic bar-timestamp convention check (`bar_stamp = auto|start|end`)
-- [ ] 5-min speed-up (target < 30 min per configuration on CPU)
-- [ ] Integration pass: full tests, 4-config smoke run, quick ablation
-- [ ] Fable math review of the above, and apply the confirmed fixes
+## Paused
+
+- [ ] Fable math review of the overnight/orthogonality/stage-2/speed changes, then apply fixes.
+      Paused at the user's request (the Fable limit resets 2026-11-29). Resume with the
+      `garchpinn-fix-all` workflow script (`resumeFromRunId wf_51bf06f3-3f4`).
+
+## Open issues from integration (synthetic data)
+
+- [ ] GARCH(1,1) benchmark (`benchmarks.py`) is now the main 5-min cost, so a full 5-min run
+      still takes more than 30 min
+- [ ] EGARCH daily: the NN overfits (val NLL rises even while the econ params are frozen),
+      so stage 2 is discarded. Needs more data, a stronger lambda_g, a smaller net, or
+      `nn_state_inputs=False`
+- [ ] HAR beats the models at the daily k=22 horizon
+- [ ] F3 plot: Monte Carlo overlay barely visible, and the inset overlaps the curve
+- [ ] I5 plot: the stage-1 point is hidden under the stage-2 point
+- [ ] Optional day-boundary jump term in the 5-min recursion (doc lists it as an extension)
 
 ## Next
 

@@ -48,6 +48,9 @@ VARIANTS = {
     "reinit_state": ("re-initialised state per chunk", {"carry_state": False}, None),
     "tau0": ("tau == 0 (no leverage)", {"no_leverage": True}, None),
     "partial_lik": ("no measurement eq. (partial l_r)", {"likelihood": "partial"}, None),
+    "overnight_drop": ("overnight return dropped (no kappa)", {"overnight": "drop"}, None),
+    "moment_raw": ("unstandardised R_moment", {"moment_standardize": False}, None),
+    "no_warmup": ("no econ warm-up, econ lr = lr", {"econ_warmup": 0, "econ_lr_mult": 1.0}, None),
 }
 # Table rows covered by the run axes rather than a Config override: compare models / freqs
 # of the "baseline" rows (P1 groups by model and freq).
