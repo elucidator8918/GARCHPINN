@@ -3,6 +3,7 @@
     python main.py                                  # all 4 configurations
     python main.py --model egarch --freq daily
     python main.py --no-nn                          # pure Realized (E)GARCH (QMLE only)
+    python main.py --device cuda --parallel-configs # 4 configs at once, one process per GPU
 """
 import argparse
 import copy
@@ -19,7 +20,8 @@ from garchpinn.evaluate import evaluate  # noqa: E402
 from garchpinn.data import build_dataset, future_cal_angles, get_series  # noqa: E402
 from garchpinn.models import build_model  # noqa: E402
 from garchpinn.plots import plot_fit  # noqa: E402
-from garchpinn.utils import _jsonable, save_model, set_seeds  # noqa: E402
+from garchpinn.utils import (_jsonable, assign_devices, make_generator, pin_device,  # noqa: E402
+                             resolve_device, save_model, set_seeds)
 
 
 def fit_two_stage(model, ds, cfg, log=None):
@@ -140,8 +142,8 @@ def run_diagnostics(model, pure, ds, cfg, df, out, state, fc, metrics, series, o
     res["calibration"] = cal
     _step("E5", lambda: P.plot_E5(cal, od), res)
     sl = ds.split("test")
-    rte = ds.r[sl].numpy()
-    var = D.var_backtest(rte, float(model.mu), torch.exp(out["log_h"][sl]).numpy())
+    rte = ds.r[sl].cpu().numpy()
+    var = D.var_backtest(rte, float(model.mu), torch.exp(out["log_h"][sl]).cpu().numpy())
     res["var_backtest"] = {a: {k: v for k, v in d.items() if k not in ("q", "hits_mask")} for a, d in var.items()}
     _step("E6", lambda: P.plot_E6(rte, var, od), res)
     return res
@@ -151,10 +153,13 @@ def run(cfg: Config, cache):
     set_seeds(cfg.seed)
     if cfg.freq not in cache:
         cache[cfg.freq] = get_series(cfg)
-    ds = build_dataset(cache[cfg.freq], cfg)
+    dev = resolve_device(cfg.device, cfg)
+    cfg.device = dev
+    pin_device(dev)
+    ds = build_dataset(cache[cfg.freq], cfg, device=dev)
     n_exo = ds.exo.shape[-1]
-    print(f"\n=== {cfg.name}: T={ds.T} (train {ds.n_train}, val {ds.n_val}) ===")
-    model = build_model(cfg, n_exo)
+    print(f"\n=== {cfg.name}: T={ds.T} (train {ds.n_train}, val {ds.n_val}) on {dev} ===")
+    model = build_model(cfg, n_exo).to(dev)
 
     log = None
     if cfg.use_wandb:
@@ -172,7 +177,7 @@ def run(cfg: Config, cache):
         out, state = model(ds.r, ds.log_x, ds.exo)
         H = cfg.forecast_horizon
         W = max(cfg.har_windows)
-        t = lambda a: torch.as_tensor(a, dtype=ds.r.dtype)
+        t = lambda a: torch.as_tensor(a, dtype=ds.r.dtype, device=ds.r.device)
         exo_ctx = None
         if ds.exo_mu is not None:
             exo_ctx = {"lx_hist": ds.log_x[-W:], "windows": cfg.har_windows, "mu": t(ds.exo_mu),
@@ -181,7 +186,7 @@ def run(cfg: Config, cache):
         mg = cfg.forecast_mgf if model.emp_resid is not None else "gaussian"
         alt, suf = ("empirical", "_emp") if mg == "gaussian" else ("gaussian", "_gauss")
         fc = {"analytic": model.forecast(out["log_h_next"], H, g_bar=gb, mgf=mg),
-              "mc": model.simulate_forecast(state, H, cfg.n_paths, torch.Generator().manual_seed(cfg.seed),
+              "mc": model.simulate_forecast(state, H, cfg.n_paths, make_generator(cfg.seed, ds.r.device),
                                             exo_ctx=exo_ctx)}
         if model.emp_resid is not None:
             fc["analytic" + suf] = model.forecast(out["log_h_next"], H, g_bar=gb, mgf=alt)
@@ -213,6 +218,29 @@ def run(cfg: Config, cache):
     return summary
 
 
+def _run_worker(cfg):
+    import torch as _t
+    _t.set_default_dtype(_t.float64)
+    return cfg.name, cfg.device, run(cfg, {})["metrics"]
+
+
+def run_parallel(cfgs, device="auto", gpus=None):
+    """One process per configuration (spawn); with CUDA, configs go round-robin over GPUs."""
+    import concurrent.futures as cf
+    import multiprocessing as mp
+    devs = assign_devices(len(cfgs), device, gpus, cfgs[0])
+    nthreads = max(1, (os.cpu_count() or 1) // len(cfgs))
+    for cfg, d in zip(cfgs, devs):
+        cfg.device = d
+        print(f"config {cfg.name} -> {d}")
+    res = {}
+    with cf.ProcessPoolExecutor(len(cfgs), mp_context=mp.get_context("spawn"),
+                                initializer=torch.set_num_threads, initargs=(nthreads,)) as ex:
+        for name, d, met in ex.map(_run_worker, cfgs):
+            res[name] = met
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", choices=[*MODELS, "all"], default="all")
@@ -227,11 +255,16 @@ def main():
     ap.add_argument("--fast", action="store_true", help="skip the profile likelihood and the MCS")
     ap.add_argument("--recovery", action="store_true", help="I3 parameter recovery by simulation (slow)")
     ap.add_argument("--rolling", action="store_true", help="I4 rolling-window parameters (slow)")
+    ap.add_argument("--device", default="auto",
+                    help="auto (CUDA only for wide workloads), cpu, cuda, cuda:K; never MPS")
+    ap.add_argument("--gpus", default=None, help="GPU ids for cuda, e.g. 0,1,2 (default: all visible)")
+    ap.add_argument("--parallel-configs", action="store_true",
+                    help="run the configurations concurrently, one process per GPU (or per CPU slot)")
     a = ap.parse_args()
 
     models = MODELS if a.model == "all" else (a.model,)
     freqs = FREQS if a.freq == "all" else (a.freq,)
-    cache, all_res = {}, {}
+    cache, all_res, cfgs = {}, {}, []
     for fq in freqs:
         for m in models:
             kw = dict(model=m, freq=fq, use_nn=not a.no_nn, use_wandb=a.wandb, out_dir=a.out,
@@ -242,6 +275,13 @@ def main():
             cfg = Config(**kw)
             if a.epochs is not None:
                 cfg.epochs = a.epochs
+            # plain "cuda" -> the first of --gpus (run_parallel reassigns round-robin)
+            cfg.device = resolve_device(a.device, cfg, a.gpus) if a.device == "cuda" else a.device
+            cfgs.append(cfg)
+    if a.parallel_configs and len(cfgs) > 1:
+        all_res = run_parallel(cfgs, a.device, a.gpus)
+    else:
+        for cfg in cfgs:
             all_res[cfg.name] = run(cfg, cache)["metrics"]
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "summary.json"), "w") as f:

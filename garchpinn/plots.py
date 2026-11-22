@@ -137,7 +137,7 @@ def plot_F1(ds, out, out_dir, pure_out=None):
 def plot_F2(model, out, ds, out_dir, n_bins=20):
     import torch
     from .diagnostics import norm_ppf  # noqa: F401
-    zg = torch.linspace(-4, 4, 201, dtype=ds.r.dtype)
+    zg = torch.linspace(-4, 4, 201, dtype=ds.r.dtype, device=ds.r.device)
     z = _np(out["z"]).ravel()
     lh = _np(out["log_h"]).ravel()
     resid = _np(ds.log_x) - float(model.xi) - float(model.phi) * lh  # = delta(z) + u (meas. eq.)
@@ -164,7 +164,7 @@ def plot_F2(model, out, ds, out_dir, n_bins=20):
         lab, ttl = "tau(z)", "F2 tau(z) (measurement eq.)"
         a.plot(zg_, float(model.gamma) * meas, ":", label="gamma tau(z): impact on log h_{t+1}")
     a.plot(zg_, meas, label=lab)
-    a.errorbar(bz, bm - np.mean(bm) + np.mean(_np(model.meas_lev(torch.as_tensor(z)))), yerr=2 * bs,
+    a.errorbar(bz, bm - np.mean(bm) + np.mean(_np(model.meas_lev(torch.as_tensor(z, device=model.d1.device)))), yerr=2 * bs,
                fmt="o", ms=3, color="k", lw=0.8, label="binned mean log x - xi - phi log h (+-2 se)")
     a.set(xlabel="z", ylabel="log-variance units", title=ttl, xlim=(-4, 4))
     a.legend(fontsize=7)

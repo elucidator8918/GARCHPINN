@@ -30,7 +30,7 @@ def psi(c, a1, a2, b, sigma_u):
     """log E exp(c [a1 z + a2 (z^2-1) + b u]) for z ~ N(0,1), u ~ N(0, sigma_u^2) independent.
     Valid when 1 - 2 c a2 > 0 (reference doc eq. mgf)."""
     q = 1 - 2 * c * a2
-    if torch.any(torch.as_tensor(q) <= 0):
+    if torch.any(torch.as_tensor(q) <= 0):  # cpu-ok: keeps the input's device
         raise ValueError("moment generating function undefined: 1 - 2 c a2 <= 0")
     return -0.5 * torch.log(q) - c * a2 + (c * a1) ** 2 / (2 * q) + 0.5 * (c * b * sigma_u) ** 2
 
@@ -47,7 +47,7 @@ class RealizedPINN(nn.Module):
         self.n_exo_nn = n_exo - 2 if self.overnight else n_exo
         if self.overnight and self.n_exo_nn < 0:
             raise ValueError("overnight=True needs the (on, r_on) exo columns")
-        P = lambda v: nn.Parameter(torch.tensor(float(v)))
+        P = lambda v: nn.Parameter(torch.tensor(float(v)))  # cpu-ok: module init, moved by .to()
         # typical magnitudes from HHS (2012) / HH (2016) as initial values (doc Section 6)
         self.mu = P(0.0)
         self.omega = P(0.0)
@@ -63,8 +63,8 @@ class RealizedPINN(nn.Module):
         self.log_h_bound = log_h_bound
         # centre of the log h guard (set to the training log variance before stage 1) and
         # training mean of the NN correction (used for forecast steps >= 2)
-        self.register_buffer("lh_center", torch.tensor(0.0))
-        self.register_buffer("g_bar", torch.tensor(0.0))
+        self.register_buffer("lh_center", torch.tensor(0.0))  # cpu-ok: module init
+        self.register_buffer("g_bar", torch.tensor(0.0))  # cpu-ok: module init
         self.emp_resid = None  # (z, u) training residuals for the empirical MGF
 
         self.use_nn = use_nn
@@ -223,7 +223,8 @@ class RealizedPINN(nn.Module):
             nf = self.n_exo_nn
             pre1 = F.linear(exo[..., :nf], lin1.weight[:, :nf], lin1.bias)  # (B, L, H)
             w_z, w_h = lin1.weight[:, nf], lin1.weight[:, nf + 1]
-        no_grad = not torch.is_grad_enabled() and r.device.type == "cpu"
+        # numpy loop on CPU, and on CUDA for narrow batches (the GPU loop is kernel-launch bound)
+        no_grad = not torch.is_grad_enabled() and (r.device.type == "cpu" or Bsz < 256)
         if no_grad:
             with np.errstate(over="ignore"):  # SiLU exp(-v) -> inf gives v/inf = -0, as torch
                 lh_all, g_all = self._loop_numpy(lh, g0, a_all, rc, pre1 if state_nn else None,
@@ -368,7 +369,7 @@ class RealizedPINN(nn.Module):
         if mgf == "empirical":
             z, u = self.emp_resid
             return torch.logsumexp(self.meas_lev(z).detach() + u, 0) - math.log(z.numel())
-        return psi(torch.tensor(1.0, dtype=dtype), self.d1.detach(), self.d2.detach(), 1.0, su)
+        return psi(self.d1.new_tensor(1.0, dtype=dtype), self.d1.detach(), self.d2.detach(), 1.0, su)
 
     @torch.no_grad()
     def forecast(self, log_h1, horizon, g_bar=None, mgf="gaussian"):
@@ -386,7 +387,7 @@ class RealizedPINN(nn.Module):
             raise ValueError("call set_empirical_mgf first")
         c, a, A1, A2, Bu = (v.detach() for v in self.state_space())
         su, xi, phi = self.sigma_u.detach(), self.xi.detach(), self.phi.detach()
-        gb = torch.as_tensor(0.0 if g_bar is None else g_bar, dtype=log_h1.dtype)
+        gb = torch.as_tensor(0.0 if g_bar is None else g_bar, dtype=log_h1.dtype, device=log_h1.device)
         ms = [log_h1]
         for _ in range(horizon - 1):
             ms.append(c + a * ms[-1] + gb)
@@ -394,7 +395,7 @@ class RealizedPINN(nn.Module):
         self._check_guard(m)
         zero = m.new_zeros(1)
         if horizon >= 2:  # psi only at the exponents actually used: a^j, j = 0..k-2
-            aj = a ** torch.arange(horizon - 1, dtype=m.dtype)
+            aj = a ** torch.arange(horizon - 1, dtype=m.dtype, device=m.device)
             cum_h = torch.cat([zero, torch.cumsum(self._psi_state(aj, A1, A2, Bu, su, mgf), 0)])
             cum_x = torch.cat([zero, torch.cumsum(self._psi_state(phi * aj, A1, A2, Bu, su, mgf), 0)])
         else:
@@ -427,8 +428,8 @@ class RealizedPINN(nn.Module):
         lh = self._bound(self.garch_step(st["lh"], st["lx"], st["z"], st["u"]) + self.correction(feats(0), st["z"], st["lh"]))
         hs, xs = [], []
         for j in range(horizon):
-            z = torch.randn(n_paths, generator=generator, dtype=lh.dtype)
-            u = torch.randn(n_paths, generator=generator, dtype=lh.dtype) * self.sigma_u
+            z = torch.randn(n_paths, generator=generator, dtype=lh.dtype, device=lh.device)
+            u = torch.randn(n_paths, generator=generator, dtype=lh.dtype, device=lh.device) * self.sigma_u
             lx = self.xi + self.phi * lh + self.meas_lev(z) + u
             hs.append(lh.exp()), xs.append(lx.exp())
             if hist is not None:
@@ -440,13 +441,14 @@ class RealizedPINN(nn.Module):
     @torch.no_grad()
     def simulate(self, T, seed=0, burn_in=500):
         """Simulate (r, log x, log h) from the pure model (NN off), Algorithm 4."""
-        gen = torch.Generator().manual_seed(seed)
+        dev = self.omega.device
+        gen = torch.Generator(device=dev).manual_seed(seed)
         c, a, *_ = self.state_space()
         lh = (c / (1 - a)).detach()
         r, lx, lhs = [], [], []
         for _ in range(T + burn_in):
-            z = torch.randn((), generator=gen)
-            u = torch.randn((), generator=gen) * self.sigma_u
+            z = torch.randn((), generator=gen, device=dev)
+            u = torch.randn((), generator=gen, device=dev) * self.sigma_u
             lxt = self.xi + self.phi * lh + self.meas_lev(z) + u
             r.append(self.mu + torch.exp(0.5 * lh) * z), lx.append(lxt), lhs.append(lh)
             lh = self._bound(self.garch_step(lh, lxt, z, u))

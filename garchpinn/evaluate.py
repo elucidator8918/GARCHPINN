@@ -184,7 +184,7 @@ def evaluate(model, ds, cfg, pure_model=None, garch=None, har=None, return_serie
         t = np.arange(t0 - 1, T - k)
         tgt = csx[t + k + 1] - csx[t + 1]
         cand = {n: fcs[n][k][t] for n in fcs}
-        gf = _np(garch.forecast(h_g[torch.as_tensor(t + 1)], k).sum(-1))
+        gf = _np(garch.forecast(h_g[torch.as_tensor(t + 1, device=h_g.device)], k).sum(-1))
         cand["garch11"] = c_hat * gf
         cand["garch11_raw"] = gf
         cand["har"] = har.predict_sum(_np(ds.log_x), k)[t]
@@ -197,7 +197,7 @@ def evaluate(model, ds, cfg, pure_model=None, garch=None, har=None, return_serie
         res[f"k={k}"] = rk
         series[f"k={k}"] = {"t": t, "target": tgt, "forecast": cand, "loss": losses}
 
-    mask = torch.zeros(T, dtype=ds.r.dtype)
+    mask = torch.zeros(T, dtype=ds.r.dtype, device=ds.r.device)
     mask[te] = 1.0
     ll = {}
     with torch.no_grad():

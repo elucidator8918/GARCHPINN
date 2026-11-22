@@ -90,6 +90,8 @@ class Config:
     mcs_alpha: float = 0.10
     mcs_boot: int = 500
 
+    # "auto" (CUDA only for wide workloads, see utils.resolve_device), "cpu", "cuda", "cuda:K"
+    device: str = "auto"
     seed: int = 42
     use_wandb: bool = False
     out_dir: str = "results"

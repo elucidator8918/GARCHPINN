@@ -19,8 +19,8 @@ class EGARCHPINN(RealizedPINN):
 
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
-        self.t1 = nn.Parameter(torch.tensor(-0.1))
-        self.t2 = nn.Parameter(torch.tensor(0.05))
+        self.t1 = nn.Parameter(torch.tensor(-0.1))  # cpu-ok: module init
+        self.t2 = nn.Parameter(torch.tensor(0.05))  # cpu-ok: module init
         self.gamma.data.fill_(0.3)
         self.omega.data.fill_(0.0)
 
@@ -32,7 +32,7 @@ class EGARCHPINN(RealizedPINN):
         return self.omega + self.beta * lh + self.t1 * z + self.t2 * (z * z - 1) + self.gamma * u
 
     def garch_coefs(self):
-        z0 = torch.zeros((), dtype=self.omega.dtype)
+        z0 = self.omega.new_zeros(())
         return self.omega, self.beta, z0, self.t1, self.t2, self.gamma
 
     def state_space(self):

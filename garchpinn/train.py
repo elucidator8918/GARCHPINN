@@ -90,7 +90,7 @@ def stage2_pinn(model, ds, cfg, log=None):
             opt.param_groups[0]["lr"] = 0.0
         model.train()
         state = None
-        tot = torch.zeros((), dtype=r.dtype)
+        tot = torch.zeros((), dtype=r.dtype, device=r.device)
         sums, nb = {}, 0
         for a in range(0, L, cfg.chunk_len):
             b = min(a + cfg.chunk_len, L)

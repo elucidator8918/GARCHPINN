@@ -1,15 +1,19 @@
 """Ablation driver (reference doc, section "Ablation study design", plots P1-P5).
 
 Each variant is a Config override (plus an optional dataset transform). Every run fits the
-two-stage model with main.fit_two_stage, evaluates it with main.run_evaluate and appends one
-tidy row to <out>/runs.jsonl (source of truth; resumable), from which results.csv/json are
-rebuilt. Per-t test QLIKE losses (one row per horizon, NaN padded) go to <out>/losses/*.npy
+two-stage model with main.fit_two_stage, evaluates it with main.run_evaluate and writes one
+tidy row to <out>/runs/<run>.json (atomically; source of truth, resumable), from which
+results.csv/json are rebuilt. Runs can go to a spawn ProcessPoolExecutor (jobs > 1), one
+device per worker (CUDA: round-robin over the GPUs). A legacy <out>/runs.jsonl is still read. Per-t test QLIKE losses (one row per horizon, NaN padded) go to <out>/losses/*.npy
 as float32 for the paired DM matrix (P4).
 """
+import concurrent.futures as cf
 import itertools
 import json
 import math
+import multiprocessing as mp
 import os
+import tempfile
 import time
 
 import numpy as np
@@ -20,7 +24,7 @@ from .config import Config
 from .data import build_dataset, get_series
 from .evaluate import _model_sum_forecasts, _t_sf2, dm_test, qlike
 from .models import build_model
-from .utils import _jsonable, set_seeds
+from .utils import _jsonable, assign_devices, pin_device, set_seeds
 
 
 def _drop_har(ds, cfg):
@@ -117,10 +121,11 @@ def run_one(cfg, df, transform=None):
     import main as M  # repo-root main.py: reuse its two-stage fit and evaluation
 
     set_seeds(cfg.seed)
-    ds = build_dataset(df, cfg)
+    dev = cfg.device if cfg.device not in (None, "auto") else "cpu"
+    ds = build_dataset(df, cfg, device=dev)
     if transform is not None:
         ds = transform(ds, cfg)
-    model = build_model(cfg, ds.exo.shape[-1])
+    model = build_model(cfg, ds.exo.shape[-1]).to(dev)
     t_start = time.time()
     hist, pure = M.fit_two_stage(model, ds, cfg)
     model.eval()
@@ -151,59 +156,167 @@ def run_one(cfg, df, transform=None):
     return row, hist_small, losses
 
 
+def _fname(rid):
+    return rid.replace("|", "__")
+
+
+def _atomic_write(path, write):
+    """write(tmp_path) then rename over path (atomic on POSIX, same directory)."""
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp_", suffix=os.path.splitext(path)[1])
+    os.close(fd)
+    try:
+        write(tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _is_done(out, rid):
+    f = _fname(rid)
+    return (os.path.exists(os.path.join(out, "runs", f + ".json"))
+            and os.path.exists(os.path.join(out, "losses", f + ".npy")))
+
+
 def _load_done(out):
+    """Rows from runs/*.json plus any legacy runs.jsonl rows not superseded."""
+    rows = {}
     p = os.path.join(out, "runs.jsonl")
-    if not os.path.exists(p):
-        return []
-    with open(p) as f:
-        return [json.loads(l) for l in f if l.strip()]
+    if os.path.exists(p):
+        with open(p) as f:
+            for l in f:
+                if l.strip():
+                    r = json.loads(l)
+                    rows[r["run_id"]] = r
+    d = os.path.join(out, "runs")
+    if os.path.isdir(d):
+        for fn in sorted(os.listdir(d)):
+            if fn.endswith(".json") and not fn.startswith(".tmp_"):
+                with open(os.path.join(d, fn)) as f:
+                    r = json.load(f)
+                rows[r["run_id"]] = r
+    return list(rows.values())
 
 
 def write_tables(rows, out):
     flat = [{k: v for k, v in r.items() if k != "history"} for r in rows]
     df = pd.DataFrame(flat)
-    df.to_csv(os.path.join(out, "results.csv"), index=False)
-    with open(os.path.join(out, "results.json"), "w") as f:
-        json.dump(_jsonable(rows), f, indent=1, default=str)
+    _atomic_write(os.path.join(out, "results.csv"), lambda p: df.to_csv(p, index=False))
+
+    def wj(p):
+        with open(p, "w") as f:
+            json.dump(_jsonable(rows), f, indent=1, default=str)
+    _atomic_write(os.path.join(out, "results.json"), wj)
     return df
 
 
-def run_ablation(variants, models, freqs, seeds, out, data_path=None, epochs=None,
-                 base=None, grid=False, verbose=True):
-    """Run every variant x model x freq x seed not already in <out>/runs.jsonl."""
-    os.makedirs(os.path.join(out, "losses"), exist_ok=True)
+def dataset_cache(out, freq, cfg):
+    """Parsed series for one frequency, cached once as <out>/cache_<freq>.pt (keyed on the
+    data path) so workers do not each re-read the CSV."""
+    p = os.path.join(out, f"cache_{freq}.pt")
+    if os.path.exists(p):
+        obj = torch.load(p, weights_only=False)
+        if obj.get("data_path") == os.path.abspath(cfg.data_path):
+            return obj["df"]
+    df = get_series(cfg)
+    _atomic_write(p, lambda t: torch.save({"data_path": os.path.abspath(cfg.data_path), "df": df}, t))
+    return df
+
+
+# ---- worker state (one per process; set by _init_worker)
+_W = {"device": "cpu", "series": {}}
+
+
+def _init_worker(slots, nthreads):
+    torch.set_default_dtype(torch.float64)
+    torch.set_num_threads(nthreads)
+    _W["device"] = slots.get() if slots is not None else "cpu"
+    pin_device(_W["device"])
+
+
+def _do_run(task):
+    """One run in the current process; writes losses/<f>.npy and runs/<f>.json atomically."""
+    rid, v, m, fq, s, out, base, grid = task
     reg = all_variants(grid)
+    cfg = make_config(v, m, fq, s, base, reg)
+    cfg.device = _W["device"]
+    if fq not in _W["series"]:
+        _W["series"][fq] = dataset_cache(out, fq, cfg)
+    row, hist, losses = run_one(cfg, _W["series"][fq], reg[v][2])
+    fn = _fname(rid)
+    _atomic_write(os.path.join(out, "losses", fn + ".npy"), lambda p: np.save(p, losses))
+    row = {"run_id": rid, "variant": v, "model": m, "freq": fq, "seed": s,
+           "lambda_moment": cfg.lambda_moment, "lambda_g": cfg.lambda_g,
+           "lambda_orth": cfg.lambda_orth, "losses_file": fn + ".npy", "device": cfg.device,
+           **row, "history": hist}
+
+    def wj(p):
+        with open(p, "w") as f:
+            json.dump(_jsonable(row), f, default=str)
+    _atomic_write(os.path.join(out, "runs", fn + ".json"), wj)
+    return row
+
+
+def run_ablation(variants, models, freqs, seeds, out, data_path=None, epochs=None,
+                 base=None, grid=False, verbose=True, jobs=1, device="cpu", gpus=None):
+    """Run every variant x model x freq x seed whose runs/<id>.json is missing.
+    jobs > 1: spawn worker processes, each with cores // jobs torch threads and its own
+    device (assign_devices: CUDA round-robin over `gpus`, several workers per GPU allowed)."""
+    for sub in ("losses", "runs"):
+        os.makedirs(os.path.join(out, sub), exist_ok=True)
     base = dict(base or {})
     if data_path:
         base["data_path"] = data_path
     if epochs is not None:
         base["epochs"] = epochs
-    rows = _load_done(out)
-    done = {r["run_id"] for r in rows}
-    cache = {}
+    legacy = {r["run_id"] for r in _load_done(out)}
+    order, tasks = [], []
     for fq in freqs:
         for v in variants:
             for m in models:
                 for s in seeds:
                     rid = run_id(v, m, fq, s)
-                    if rid in done:
-                        continue
-                    cfg = make_config(v, m, fq, s, base, reg)
-                    if fq not in cache:
-                        cache[fq] = get_series(cfg)
-                    row, hist, losses = run_one(cfg, cache[fq], reg[v][2])
-                    fn = rid.replace("|", "__") + ".npy"
-                    np.save(os.path.join(out, "losses", fn), losses)
-                    row = {"run_id": rid, "variant": v, "model": m, "freq": fq, "seed": s,
-                           "lambda_moment": cfg.lambda_moment, "lambda_g": cfg.lambda_g,
-                           "lambda_orth": cfg.lambda_orth, "losses_file": fn, **row, "history": hist}
-                    with open(os.path.join(out, "runs.jsonl"), "a") as f:
-                        f.write(json.dumps(_jsonable(row), default=str) + "\n")
-                    rows.append(row)
-                    done.add(rid)
-                    if verbose:
-                        print(f"[{len(done)}] {rid}: test l_rx={row['test_l_rx']:.4f} "
-                              f"qlike_h0={row['qlike_h0']:.4f} ({row['runtime_s']:.1f}s)", flush=True)
+                    order.append(rid)
+                    if rid not in legacy and not _is_done(out, rid):
+                        tasks.append((rid, v, m, fq, s, out, base, grid))
+    jobs = max(1, min(int(jobs), len(tasks) or 1))
+    probe = make_config(variants[0], models[0], freqs[0], seeds[0], base, all_variants(grid)) if order else None
+    devs = assign_devices(jobs, device, gpus, probe)
+    nthreads = max(1, (os.cpu_count() or 1) // jobs)
+    n_done = len(order) - len(tasks)
+
+    def report(row):
+        nonlocal n_done
+        n_done += 1
+        if verbose:
+            print(f"[{n_done}/{len(order)}] {row['run_id']} on {row['device']}: test l_rx="
+                  f"{row['test_l_rx']:.4f} qlike_h0={row['qlike_h0']:.4f} ({row['runtime_s']:.1f}s)",
+                  flush=True)
+
+    if verbose and tasks:
+        print(f"{len(tasks)} runs, {jobs} worker(s), {nthreads} thread(s) each, devices {devs}", flush=True)
+    if jobs == 1:
+        old = (_W["device"],)
+        _W["device"] = devs[0]
+        pin_device(devs[0])
+        try:
+            for t in tasks:
+                report(_do_run(t))
+        finally:
+            _W["device"] = old[0]
+    elif tasks:
+        ctx = mp.get_context("spawn")
+        slots = ctx.Manager().Queue()
+        for d in devs:
+            slots.put(d)
+        with cf.ProcessPoolExecutor(jobs, mp_context=ctx, initializer=_init_worker,
+                                    initargs=(slots, nthreads)) as ex:
+            futs = [ex.submit(_do_run, t) for t in tasks]
+            for f in cf.as_completed(futs):
+                report(f.result())
+    rows = {r["run_id"]: r for r in _load_done(out)}
+    rows = [rows[r] for r in order if r in rows] + [r for k, r in rows.items() if k not in set(order)]
     return write_tables(rows, out), rows
 
 

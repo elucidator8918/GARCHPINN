@@ -24,7 +24,7 @@ class GARCHPINN(RealizedPINN):
     step_uses_shock = False
 
     def garch_coefs(self):
-        z0 = torch.zeros((), dtype=self.omega.dtype)
+        z0 = self.omega.new_zeros(())
         return self.omega, self.beta, self.gamma, z0, z0, z0
 
     def state_space(self):

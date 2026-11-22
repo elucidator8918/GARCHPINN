@@ -73,11 +73,42 @@ garch vs egarch and daily vs 5-min are the run axes.
     python ablate.py --grid --variants baseline                   # lambda_m x lambda_g x lambda_orth grid (P2)
     python ablate.py --quick --data fake.csv --out abl_smoke      # tiny smoke run
 
-Outputs in `--out` (default `results/ablation`): `runs.jsonl` (resumable; finished runs are skipped),
+Outputs in `--out` (default `results/ablation`): `runs/<run>.json` (one per run, written atomically;
+resumable, finished runs are skipped), `cache_<freq>.pt` (parsed data, shared by workers),
 `results.csv`/`results.json` (one row per run: test l_r/l_rx, QLIKE/MSE per horizon, params `p_*` and
 stage-1 params `s1_*`, val NLL, runtime), `losses/*.npy` (per-t test QLIKE, float32), plots P1-P5
 (P4 is the paired DM matrix with Holm-adjusted p-values) and `summary.md` (mean +- 95% seed t-interval).
 Holm is applied within each DM matrix only. Across the whole study, control multiplicity as the doc describes.
+
+## Running on a Linux GPU machine
+
+    git clone -b realized-garch-rewrite <repo-url> GARCHPINN && cd GARCHPINN
+    scp mac:~/GARCHPINN-1/UK_Index_2000_2025.csv .        # the CSV is gitignored: copy it by hand
+    CUDA=cu124 bash scripts/setup_linux.sh                 # venv, CUDA torch, deps, lists every GPU, pytest
+
+Recommended order (daily first, it is cheap and validates the real data):
+
+    python main.py --freq daily --device cpu                        # both daily models
+    python ablate.py --freqs daily --jobs 32                        # CPU workers, cores // jobs threads each
+    python main.py --device cuda --parallel-configs                 # 4 configs at once, one process per GPU
+    python ablate.py --freqs 5min --jobs 6 --device cuda --gpus 0,1,2   # 3 GPUs, 2 workers per GPU
+
+Devices: `--device auto|cpu|cuda|cuda:K` (MPS is never used: no float64), `--gpus 0,1,2` (default: all
+GPUs visible under `CUDA_VISIBLE_DEVICES`). `auto` picks CUDA only for wide workloads
+(`streams * chunk_len >= 2^18` or `n_paths >= 200k`); otherwise CPU, because the recursion is sequential
+and a GPU spends its time launching tiny kernels. The GARCH(1,1) benchmark always fits on CPU.
+`ablate.py --jobs N` uses spawn worker processes; each is pinned to one device (`torch.cuda.set_device`),
+GPUs are assigned round-robin (N may exceed the GPU count) and every result row records its `device`.
+
+There is no DataParallel/DDP: one model is tiny and its filter is sequential in time, so the useful
+parallelism is across runs (ablation cells, seeds, configurations), not within one.
+
+Expected speed-ups: ablations scale close to linearly in `--jobs` on CPU until memory bandwidth
+saturates (on an 8-core Mac the quick sweep went from 38 s with `--jobs 1` to 25 s with `--jobs 2`,
+including the spawn start-up); for the full daily sweep (~5-14 h serial) expect roughly
+cores/2 x. A GPU helps a single run only for the 5-min stage-1/stage-2 with many streams and for large
+Monte Carlo path counts; on daily data stay on CPU. These GPU figures are untested so far: measure
+on the box (`runtime_s` in `results.csv`).
 
 ## Layout
 

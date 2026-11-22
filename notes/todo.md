@@ -26,6 +26,10 @@ Last updated: 2026-11-23. See also [plan.md](plan.md) for the fast-filter / para
 - [x] 5-min speed-up: filter restructured (same maths, matches `forward_reference` to 1e-12)
 - [x] Integration pass: 63 tests pass; 4-config smoke and quick ablation clean
 - [x] Ablation switches for the new features: `overnight_drop`, `moment_raw`, `no_warmup`
+- [x] `--device auto|cpu|cuda|cuda:K` and `--gpus` (main.py, ablate.py); device threaded through all
+      modules, static audit test of tensor factories, meta-device forward test, mocked 1/3-GPU assignment
+- [x] `ablate.py --jobs N` (spawn pool, per-run atomic `runs/*.json`, dataset cache, GPU round-robin);
+      `main.py --parallel-configs`; `scripts/setup_linux.sh`; README GPU section
 
 ## Paused
 
@@ -51,9 +55,9 @@ Last updated: 2026-11-23. See also [plan.md](plan.md) for the fast-filter / para
       validated on real data yet.
 - [ ] Check on real data: first-bar stamping, bars/session (~102?), High/Low columns present
 - [ ] Parallel-scan filter for GARCHPINN (see plan.md §1)
-- [ ] `ablate.py --jobs N` for parallel runs across CPU cores (plan.md §2)
 - [ ] Full ablation sweep: daily first (~5–14 h serial), 5-min after the speed-up
-- [ ] `--device` option; CUDA only for wide stream counts (MPS has no float64)
+- [ ] On the GPU box: run `scripts/setup_linux.sh`; check the CUDA tests pass (CPU/GPU agreement 1e-8,
+      2 jobs on 2 GPUs) and measure `--device cuda` vs cpu for 5-min; tune `AUTO_CUDA_MIN_WIDTH`
 
 ## Known limitations / nice-to-have
 

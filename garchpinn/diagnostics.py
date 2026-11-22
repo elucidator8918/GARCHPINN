@@ -182,8 +182,8 @@ def cross_corr(a, b, max_lag=10):
 
 def residuals(out, model):
     """z_t and u_t / sigma_u as numpy arrays."""
-    z = out["z"].detach().numpy().ravel()
-    u = (out["u"] / model.sigma_u).detach().numpy().ravel()
+    z = out["z"].detach().cpu().numpy().ravel()
+    u = (out["u"] / model.sigma_u).detach().cpu().numpy().ravel()
     return z, u
 
 
@@ -286,14 +286,14 @@ def standard_errors(model, ds, burn_in=22, max_obs=6000):
     try:
         S = torch.autograd.functional.jacobian(f, theta, vectorize=True, strategy="forward-mode")
     except Exception:  # fallback: one forward-mode jvp per parameter
-        S = torch.stack([torch.func.jvp(f, (theta,), (torch.eye(len(theta))[i],))[1]
+        S = torch.stack([torch.func.jvp(f, (theta,), (torch.eye(len(theta), dtype=theta.dtype, device=theta.device)[i],))[1]
                          for i in range(len(theta))], 1)
-    Hn, Sn = H.detach().numpy(), S.detach().numpy()
+    Hn, Sn = H.detach().cpu().numpy(), S.detach().cpu().numpy()
     Ainv = np.linalg.pinv(-Hn)
     J = Sn.T @ Sn
     cov_h, cov_s = Ainv, Ainv @ J @ Ainv
     se_h, se_s = np.sqrt(np.abs(np.diag(cov_h))), np.sqrt(np.abs(np.diag(cov_s)))
-    return {"names": names, "estimate": theta.numpy().tolist(), "se_hessian": se_h.tolist(),
+    return {"names": names, "estimate": theta.detach().cpu().numpy().tolist(), "se_hessian": se_h.tolist(),
             "se_sandwich": se_s.tolist(), "ratio": (se_s / np.maximum(se_h, 1e-300)).tolist(),
             "cov_hessian": cov_h.tolist(), "cov_sandwich": cov_s.tolist(), "n": int(Sn.shape[0]),
             "mean_score_norm": float(np.linalg.norm(Sn.mean(0)))}
@@ -308,7 +308,7 @@ def _lbfgs(f, free0, iters):
         opt.zero_grad()
         v = f(x)
         if not torch.isfinite(v):
-            v = torch.tensor(1e10, dtype=x.dtype, requires_grad=True) + 0 * x.sum()
+            v = torch.tensor(1e10, dtype=x.dtype, device=x.device, requires_grad=True) + 0 * x.sum()
         v.backward()
         return v
     try:
@@ -347,13 +347,13 @@ def profile_likelihood(model, ds, se=None, params=("persistence", "gamma", "phi"
             grid = np.clip(grid, 1e-3, PERSIST_MAX - 1e-6)
         if name == "sigma_u":
             grid = np.clip(grid, 1e-3, None)
-        free_idx = torch.tensor([j for j in range(len(theta)) if j != i])
+        free_idx = torch.tensor([j for j in range(len(theta)) if j != i], device=theta.device)
         prof = []
         for gv in grid:
             def fp(x, gv=gv):
                 th = th_all.clone()
                 th = th.index_put((free_idx,), x)
-                th = torch.cat([th[:i], torch.tensor([gv], dtype=th.dtype), th[i + 1:]])
+                th = torch.cat([th[:i], torch.tensor([gv], dtype=th.dtype, device=th.device), th[i + 1:]])
                 return negll(th)
             _, v = _lbfgs(fp, th_all[free_idx], iters)
             prof.append(v)
@@ -413,7 +413,8 @@ def impulse_response(model, K, state=None, n_paths=2000, eps=0.1, seed=0):
 @torch.no_grad()
 def _sim_logh(model, state, K, n, seed, du0=0.0):
     """(n, K) simulated log h_{t+1..t+K} from a filter state; du0 shocks u_t and log x_t."""
-    gen = torch.Generator().manual_seed(seed)
+    dev = state["lh"].device
+    gen = torch.Generator(device=dev).manual_seed(seed)
     st = {k: (v.expand(n, *v.shape[-1:]) if k == "f" else v.expand(n)).clone() for k, v in state.items()}
     st["u"] = st["u"] + du0
     st["lx"] = st["lx"] + du0
@@ -422,11 +423,11 @@ def _sim_logh(model, state, K, n, seed, du0=0.0):
     out = []
     for _ in range(K):
         out.append(lh)
-        z = torch.randn(n, generator=gen, dtype=lh.dtype)
-        u = torch.randn(n, generator=gen, dtype=lh.dtype) * model.sigma_u
+        z = torch.randn(n, generator=gen, dtype=lh.dtype, device=dev)
+        u = torch.randn(n, generator=gen, dtype=lh.dtype, device=dev) * model.sigma_u
         lx = model.xi + model.phi * lh + model.meas_lev(z) + u
         lh = model._bound(model.garch_step(lh, lx, z, u) + model.correction(st["f"], z, lh))
-    return torch.stack(out, 1).numpy()
+    return torch.stack(out, 1).cpu().numpy()
 
 
 @torch.no_grad()
@@ -450,7 +451,7 @@ def term_structure(model, log_h, idx, Ks, periods_per_year=252):
     gb = model.g_bar if model.nn_active else 0.0
     res = {"K": list(Ks)}
     for nm, t in picks.items():
-        h = model.forecast(lh[t: t + 1], max(Ks), g_bar=gb)["h"][0].numpy()
+        h = model.forecast(lh[t: t + 1], max(Ks), g_bar=gb)["h"][0].cpu().numpy()
         cs = np.cumsum(h)
         res[nm] = {"t": t, "vol": [float(np.sqrt(periods_per_year / K * cs[K - 1])) for K in Ks]}
     return res
@@ -482,16 +483,16 @@ def g_from_inputs(model, X):
 def partial_dependence(model, X, n_grid=15, n_rows=300, seed=0):
     """PD / ICE of g on each input (doc F7c): {j: {grid, mean, lo, hi}} (5-95% of ICE)."""
     rng = np.random.default_rng(seed)
-    rows = X[torch.as_tensor(rng.choice(len(X), min(n_rows, len(X)), replace=False))]
+    rows = X[torch.as_tensor(rng.choice(len(X), min(n_rows, len(X)), replace=False), device=X.device)]
     res = {}
     for j in range(X.shape[1]):
-        xs = X[:, j].numpy()
+        xs = X[:, j].cpu().numpy()
         grid = np.quantile(xs, np.linspace(0.05, 0.95, n_grid))
         ice = []
         for gv in grid:
             Z = rows.clone()
             Z[:, j] = float(gv)
-            ice.append(g_from_inputs(model, Z).numpy())
+            ice.append(g_from_inputs(model, Z).cpu().numpy())
         ice = np.array(ice)  # (grid, rows)
         res[j] = {"grid": grid, "mean": ice.mean(1), "lo": np.quantile(ice, 0.05, 1),
                   "hi": np.quantile(ice, 0.95, 1)}
@@ -642,7 +643,7 @@ def parameter_recovery(variant, true_params, Ts=(500, 1000, 2500), n_rep=5, cfg=
         est, ses = [], []
         for i in range(n_rep):
             r, lx, _ = gen.simulate(T, seed=seed + 1000 * i + T)
-            ds = Dataset(r, lx, torch.zeros(T, 0, dtype=r.dtype), list(range(T)), T, 0)
+            ds = Dataset(r, lx, torch.zeros(T, 0, dtype=r.dtype, device=r.device), list(range(T)), T, 0)
             m = cls(use_nn=False)
             stage1_qmle(m, ds, c)
             est.append({k: v for k, v in m.params().items() if isinstance(v, float)})

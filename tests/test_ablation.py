@@ -49,5 +49,20 @@ def test_quick_ablation(tmp_path):
     assert L.dtype == np.float32 and L.shape[0] == 3
     # resumable: a second call runs nothing new
     df2 = ablate.main(args)
-    assert len(df2) == 2 and len(open(out / "runs.jsonl").read().splitlines()) == 2
+    assert len(df2) == 2 and len(list((out / "runs").glob("*.json"))) == 2
     assert not os.path.exists(tmp_path / "results")
+
+
+def test_jobs2_matches_jobs1(tmp_path):
+    """Same seeds give the same rows with 1 or 2 worker processes (order-independent)."""
+    data = tmp_path / "fake.csv"
+    _fake_csv(data)
+    common = ["--data", str(data), "--quick", "--variants", "baseline,tau0", "--models", "garch",
+              "--seeds", "1", "--epochs", "1"]
+    d1 = ablate.main(common + ["--jobs", "1", "--out", str(tmp_path / "j1")])
+    d2 = ablate.main(common + ["--jobs", "2", "--out", str(tmp_path / "j2")])
+    d1, d2 = (d.sort_values("run_id").reset_index(drop=True) for d in (d1, d2))
+    assert list(d1.run_id) == list(d2.run_id)
+    num = [c for c in d1.columns if c != "runtime_s" and pd.api.types.is_numeric_dtype(d1[c])]
+    np.testing.assert_allclose(d1[num].to_numpy(float), d2[num].to_numpy(float), rtol=1e-10, equal_nan=True)
+    assert (tmp_path / "j2" / "cache_daily.pt").exists()

@@ -49,12 +49,13 @@ class GARCH11:
         return th[0], omega, alpha, pers - alpha
 
     def fit(self, r, iters=200):
-        r = torch.as_tensor(r).detach()
+        # always fitted on CPU: the sequential python loop + autograd is launch-bound on a GPU
+        r = torch.as_tensor(r).detach().cpu()  # cpu-ok: deliberate CPU fit
         dt = r.dtype
         self.h0 = r[: min(22, len(r))].var(unbiased=False).clamp_min(1e-12)
         v = r.var(unbiased=False).item()
         th = torch.tensor([r.mean().item(), _inv_softplus(max(v * 0.03, 1e-8)), _logit(0.97 / PMAX),
-                           _logit(0.08 / 0.97)], dtype=dt, requires_grad=True)
+                           _logit(0.08 / 0.97)], dtype=dt, device=r.device, requires_grad=True)
         opt = torch.optim.LBFGS([th], lr=1.0, max_iter=iters, line_search_fn="strong_wolfe",
                                 tolerance_grad=1e-9, tolerance_change=1e-12)
 
@@ -75,9 +76,10 @@ class GARCH11:
     @torch.no_grad()
     def filter(self, r):
         """Returns h of length T+1: h[t] = E_{t-1} r_t^2 (centered), h[T] = forecast after last obs."""
-        r = torch.as_tensor(r)
-        h, hn = self._filter(r, self.mu, self.omega, self.alpha, self.beta, self.h0)
-        return torch.cat([h, hn[None]])
+        r = torch.as_tensor(r)  # cpu-ok: keeps the input's device
+        dev = r.device
+        h, hn = self._filter(r.cpu(), self.mu, self.omega, self.alpha, self.beta, self.h0.cpu())
+        return torch.cat([h, hn[None]]).to(dev)
 
     @property
     def uncond_var(self):
@@ -85,8 +87,8 @@ class GARCH11:
 
     def forecast(self, h1, horizon):
         """E h_{t+k}, k=1..horizon, from h_{t+1} (any shape) -> (*S, horizon)."""
-        h1 = torch.as_tensor(h1)
-        p = (self.alpha + self.beta) ** torch.arange(horizon, dtype=h1.dtype)
+        h1 = torch.as_tensor(h1)  # cpu-ok: keeps the input's device
+        p = (self.alpha + self.beta) ** torch.arange(horizon, dtype=h1.dtype, device=h1.device)
         s2 = self.uncond_var
         return s2 + p * (h1[..., None] - s2)
 

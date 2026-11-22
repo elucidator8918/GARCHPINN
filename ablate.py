@@ -4,8 +4,10 @@
     python ablate.py --variants baseline,tau0 --models egarch --freqs daily --seeds 3
     python ablate.py --grid --variants baseline         # adds the lambda_m x lambda_g x lambda_orth grid (P2)
     python ablate.py --quick --data fake.csv --out abl_smoke
+    python ablate.py --jobs 32                          # 32 CPU worker processes
+    python ablate.py --jobs 6 --device cuda --gpus 0,1,2  # 2 workers per GPU
 
-Resumable: runs already in <out>/runs.jsonl are skipped. Outputs: results.csv/json (one row
+Resumable: runs with an <out>/runs/<id>.json are skipped. Outputs: results.csv/json (one row
 per run), losses/*.npy (per-t test QLIKE, float32), P1-P5 PNGs and summary.md.
 """
 import argparse
@@ -36,6 +38,10 @@ def main(argv=None):
     ap.add_argument("--quick", action="store_true",
                     help="smoke run: daily, 2 seeds, 3 epochs, 30 L-BFGS iters, tiny MC")
     ap.add_argument("--dpi", type=int, default=120)
+    ap.add_argument("--jobs", type=int, default=1, help="parallel worker processes (spawn)")
+    ap.add_argument("--device", default="cpu",
+                    help="cpu (default), cuda (round-robin over --gpus), cuda:K, or auto; never MPS")
+    ap.add_argument("--gpus", default=None, help="GPU ids, e.g. 0,1,2 (default: all visible)")
     a = ap.parse_args(argv)
 
     base = {}
@@ -57,7 +63,7 @@ def main(argv=None):
     seeds = list(range(int(a.seeds))) if "," not in a.seeds else [int(s) for s in _list(a.seeds)]
 
     df, rows = run_ablation(variants, _list(a.models), _list(a.freqs), seeds, a.out, a.data,
-                            a.epochs, base, a.grid)
+                            a.epochs, base, a.grid, jobs=a.jobs, device=a.device, gpus=a.gpus)
     for p in make_plots(df, rows, a.out, a.dpi):
         print("wrote", p)
     md = summary_table(df)

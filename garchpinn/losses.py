@@ -23,7 +23,7 @@ def moment_residuals(z, u, sigma_u, mask=None, lags=5, standardize=False):
         z, u = z[None], u[None]
         mask = mask[None] if mask is not None else None
     m = torch.ones_like(z) if mask is None else mask.to(z.dtype)
-    u = u / torch.as_tensor(sigma_u).detach()
+    u = u / torch.as_tensor(sigma_u, device=z.device).detach()
     e = z * z - 1
     terms = [(z, m), (e, m), (u, m), (u * z, m), (u * e, m)]
     L = z.shape[1]
